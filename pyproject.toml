@@ -1,0 +1,10 @@
+[project]
+name = "psd-layers-to-gltf"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "psd-tools>=1.10.8",
+    "pygltflib>=1.16.5",
+]
