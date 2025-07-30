@@ -1,3 +1,4 @@
+import io
 import sys
 import struct
 import tempfile
@@ -9,7 +10,8 @@ from psd_tools import PSDImage
 
 LAYER_SPACING = 0.5
 PIXELS_PER_3D_UNIT = 1000
-IMAGE_FORMAT = ".bmp"
+IMAGE_FORMAT = "BMP"  # Must be valid for Image.save(format=IMAGE_FORMAT)
+IMAGE_MIMETYPE = "image/bmp"  # For GLTF (must match IMAGE_FORMAT)
 
 
 def remap(value, source_min, source_max, out_min, out_max):
@@ -134,16 +136,32 @@ def main():
 
     def layer_fn(layer, pixel_center, pixels_per_unit, gltf):
         # print("LAYER", layer, layer.offset)
+        pil_image = layer.composite()
+        image_bytes_io = io.BytesIO()
+        pil_image.save(image_bytes_io, format=IMAGE_FORMAT)
+        image_bytes = image_bytes_io.getvalue()
+        pil_image = None
 
-        with tempfile.NamedTemporaryFile(suffix=IMAGE_FORMAT) as f:
-            layer_image = layer.composite()
-            layer_image.save(f.name)
+        original_byte_len = gltf.buffers[0].byteLength
+        combined_bytes = gltf.binary_blob() + image_bytes
+        gltf.set_binary_blob(combined_bytes)
+        gltf.buffers[0].byteLength = len(combined_bytes)
 
-            image = pygltflib.Image()
-            image.uri = f.name
-            image_index = len(gltf.images)
-            gltf.images.append(image)
-            gltf.convert_images(pygltflib.ImageFormat.DATAURI)
+        buffer_view_index = len(gltf.bufferViews)
+        gltf.bufferViews.append(
+            pygltflib.BufferView(
+                buffer=0,
+                byteOffset=original_byte_len,
+                byteLength=len(image_bytes),
+            )
+        )
+
+        image_index = len(gltf.images)
+        gltf.images.append(
+            pygltflib.Image(
+                bufferView=buffer_view_index, mimeType=IMAGE_MIMETYPE, name=layer.name
+            )
+        )
 
         texture_index = len(gltf.textures)
         gltf.textures.append(
