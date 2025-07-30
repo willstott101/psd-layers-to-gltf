@@ -1,0 +1,7 @@
+.venv
+.ruff_cache
+*.bin
+*.glb
+*.gltf
+*.svg
+*.prof

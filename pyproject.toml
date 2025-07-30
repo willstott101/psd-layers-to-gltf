@@ -8,3 +8,9 @@ dependencies = [
     "psd-tools>=1.10.8",
     "pygltflib>=1.16.5",
 ]
+
+[dependency-groups]
+dev = [
+    "py-spy>=0.4.0",
+    "ruff>=0.12.7",
+]
