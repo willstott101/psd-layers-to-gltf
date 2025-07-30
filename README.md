@@ -4,4 +4,6 @@ Make sure you have uv, and python3.10. Run the program with:
 
     uv run main.py PATH/TO/MY.psd
 
-This will generate a `output.glb` will all texture and neccessary mesh data embedded.
+This will generate an `output.glb` file with all neccessary data embedded.
+
+This process can be quite slow and memory intensive for large photoshop documents.

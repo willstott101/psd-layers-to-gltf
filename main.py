@@ -1,15 +1,15 @@
 import io
 import sys
 import struct
-import tempfile
 from array import array
 
 import pygltflib
 from psd_tools import PSDImage
 
 
-LAYER_SPACING = 0.5
-PIXELS_PER_3D_UNIT = 1000
+LAYER_SPACING = 0.5  # How far apart the layers are in 3D space
+PIXELS_PER_3D_UNIT = 1000  # How many pixels wide a layer needs to be to reach 1.0 units wide in 3D
+# Using BMP results in a large file but is much faster to write than using a compressed format
 IMAGE_FORMAT = "BMP"  # Must be valid for Image.save(format=IMAGE_FORMAT)
 IMAGE_MIMETYPE = "image/bmp"  # For GLTF (must match IMAGE_FORMAT)
 
@@ -27,6 +27,7 @@ def plane_with_offset_and_size(
     pixel_center: tuple[float, float],
     pixels_per_unit: int,
     gltf,
+    buf,
 ):
     r = float(pixel_size[0]) / (pixels_per_unit * 2)
     l = -r
@@ -56,10 +57,8 @@ def plane_with_offset_and_size(
     )
     position_bytes = positions.tobytes()
 
-    original_byte_len = gltf.buffers[0].byteLength
-    combined_bytes = gltf.binary_blob() + position_bytes
-    gltf.set_binary_blob(combined_bytes)
-    gltf.buffers[0].byteLength = len(combined_bytes)
+    original_byte_len = buf.getbuffer().nbytes
+    buf.write(position_bytes)
     buffer_view_index = len(gltf.bufferViews)
     gltf.bufferViews.append(
         pygltflib.BufferView(
@@ -134,18 +133,17 @@ def main():
         )
         return node_index
 
-    def layer_fn(layer, pixel_center, pixels_per_unit, gltf):
+    def layer_fn(layer, pixel_center, pixels_per_unit, gltf, buf):
         # print("LAYER", layer, layer.offset)
         pil_image = layer.composite()
+        # We don't write directly to the main buffer, in-case Pillow decides to seek or truncate or summin.
         image_bytes_io = io.BytesIO()
         pil_image.save(image_bytes_io, format=IMAGE_FORMAT)
         image_bytes = image_bytes_io.getvalue()
         pil_image = None
 
-        original_byte_len = gltf.buffers[0].byteLength
-        combined_bytes = gltf.binary_blob() + image_bytes
-        gltf.set_binary_blob(combined_bytes)
-        gltf.buffers[0].byteLength = len(combined_bytes)
+        original_byte_len = buf.getbuffer().nbytes
+        buf.write(image_bytes)
 
         buffer_view_index = len(gltf.bufferViews)
         gltf.bufferViews.append(
@@ -186,12 +184,18 @@ def main():
             material_index,
             layer.offset,
             layer.size,
-            pixel_center,
-            pixels_per_unit,
-            gltf,
+            pixel_center=pixel_center,
+            pixels_per_unit=pixels_per_unit,
+            gltf=gltf,
+            buf=buf,
         )
 
     gltf = pygltflib.GLTF2()
+    buf = io.BytesIO()
+
+    indices = array("H", [2, 1, 0, 3, 2, 0])  # uint16
+    index_bytes = indices.tobytes()
+    buf.write(index_bytes)
 
     uvs = array(
         "f",
@@ -207,10 +211,7 @@ def main():
         ],
     )
     uvs_bytes = uvs.tobytes()
-    indices = array("H", [2, 1, 0, 3, 2, 0])  # uint16
-    index_bytes = indices.tobytes()
-    gltf.set_binary_blob(index_bytes + uvs_bytes)
-    gltf.buffers.append(pygltflib.Buffer(byteLength=len(index_bytes) + len(uvs_bytes)))
+    buf.write(uvs_bytes)
     gltf.bufferViews.extend(
         [
             pygltflib.BufferView(
@@ -253,6 +254,7 @@ def main():
         psd,
         group_fn,
         layer_fn,
+        buf=buf,
         gltf=gltf,
         pixel_center=pixel_center,
         pixels_per_unit=PIXELS_PER_3D_UNIT,
@@ -261,8 +263,9 @@ def main():
     scene = pygltflib.Scene(nodes=[node_index])
     gltf.scenes.append(scene)  # scene available at gltf.scenes[0]
 
-    # Not yet supported....
-    # gltf.convert_images(pygltflib.ImageFormat.BUFFERVIEW)
+    final_buffer = buf.getvalue()
+    gltf.set_binary_blob(final_buffer)
+    gltf.buffers.append(pygltflib.Buffer(byteLength=len(final_buffer)))
 
     # gltf.convert_buffers(pygltflib.BufferFormat.BINFILE)  # convert buffers to files
     # gltf.buffers[0].uri = "0.bin"  # TODO: Why is this not automatic?!
