@@ -9,6 +9,8 @@ Controls (minimal, format-prefixed):
   • WebP: --webp-quality   (0–100 OR 'lossless')
   • BMP : (no options)
 
+N.B. BMP is the fastest image format, WebP is the smallest but has resolution limitations.
+
 Examples:
   # Default PNG textures, spacing 0.5, 1000 px/unit
   psd2gltf artwork.psd scene.glb
