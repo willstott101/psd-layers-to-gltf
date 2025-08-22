@@ -1,18 +1,40 @@
+"""
+psd2gltf — Convert PSD layers into transparent planes in a GLB file.
+
+Controls (minimal, format-prefixed):
+  • --layer-spacing       (default 0.5)
+  • --px-per-unit         (default 1000)
+  • --texture-format      png | webp | bmp
+  • PNG : --png-compression
+  • WebP: --webp-quality   (0–100 OR 'lossless')
+  • BMP : (no options)
+
+Examples:
+  # Default PNG textures, spacing 0.5, 1000 px/unit
+  psd2gltf artwork.psd scene.glb
+
+  # GLB with WebP, lossy @ quality 80
+  psd2gltf artwork.psd scene.glb --texture-format webp --webp-quality 80
+
+  # GLB with WebP, lossless
+  psd2gltf artwork.psd scene.glb --texture-format webp --webp-quality lossless
+
+  # PNG with higher compression and denser spacing
+  psd2gltf in.psd out.glb --texture-format png --png-compression 9 \
+      --layer-spacing 0.25 --px-per-unit 2000
+"""
 import io
+import os
 import sys
+import argparse
 from array import array
+from typing import Union, Sequence
 
 import pygltflib
 from psd_tools import PSDImage
 
-
-LAYER_SPACING = 0.5  # How far apart the layers are in 3D space
-PIXELS_PER_3D_UNIT = (
-    1000  # How many pixels wide a layer needs to be to reach 1.0 units wide in 3D
-)
-# Using BMP results in a large file but is much faster to write than using a compressed format
-IMAGE_FORMAT = "BMP"  # Must be valid for Image.save(format=IMAGE_FORMAT)
-IMAGE_MIMETYPE = "image/bmp"  # For GLTF (must match IMAGE_FORMAT)
+DEFAULT_PNG_COMPRESSION = 6
+DEFAULT_WEBP_QUALITY = 82
 
 
 def shared_plane_geometry(gltf, buf):
@@ -90,6 +112,7 @@ def plane_with_offset_and_size(
     pixel_size: tuple[float, float],
     pixel_center: tuple[float, float],
     pixels_per_unit: int,
+    layer_spacing: float,
     gltf,
     buf,
     index_accessor_index,
@@ -163,7 +186,7 @@ def plane_with_offset_and_size(
     node_index = len(gltf.nodes)
     gltf.nodes.append(
         pygltflib.Node(
-            name=name, mesh=mesh_index, translation=[x, -y, node_index * LAYER_SPACING]
+            name=name, mesh=mesh_index, translation=[x, -y, node_index * layer_spacing]
         )
     )
     return node_index
@@ -193,7 +216,7 @@ def group_fn(layer, sub_layers_and_results, gltf, **_kws):
 def layer_fn(
     layer,
     pixel_center,
-    pixels_per_unit,
+    args,
     gltf,
     buf,
     index_accessor_index,
@@ -202,7 +225,7 @@ def layer_fn(
     pil_image = layer.composite()
     # We don't write directly to the main buffer, in-case Pillow decides to seek or truncate or summin.
     image_bytes_io = io.BytesIO()
-    pil_image.save(image_bytes_io, format=IMAGE_FORMAT)
+    pil_image.save(image_bytes_io, **args.pillow_args)
     image_bytes = image_bytes_io.getvalue()
     pil_image = None
 
@@ -221,7 +244,7 @@ def layer_fn(
     image_index = len(gltf.images)
     gltf.images.append(
         pygltflib.Image(
-            bufferView=buffer_view_index, mimeType=IMAGE_MIMETYPE, name=layer.name
+            bufferView=buffer_view_index, mimeType=args.gltf_image_mimetype, name=layer.name
         )
     )
 
@@ -249,7 +272,8 @@ def layer_fn(
         layer.offset,
         layer.size,
         pixel_center=pixel_center,
-        pixels_per_unit=pixels_per_unit,
+        pixels_per_unit=args.px_per_unit,
+        layer_spacing=args.layer_spacing,
         gltf=gltf,
         buf=buf,
         index_accessor_index=index_accessor_index,
@@ -257,8 +281,8 @@ def layer_fn(
     )
 
 
-def convert_psd_to_gltf(psd_file_path):
-    psd = PSDImage.open(psd_file_path)
+def convert_psd_to_gltf(args):
+    psd = PSDImage.open(args.input)
 
     gltf = pygltflib.GLTF2()
     buf = io.BytesIO()
@@ -275,7 +299,7 @@ def convert_psd_to_gltf(psd_file_path):
         buf=buf,
         gltf=gltf,
         pixel_center=pixel_center,
-        pixels_per_unit=PIXELS_PER_3D_UNIT,
+        args=args,
         index_accessor_index=index_accessor_index,
         uvs_accessor_index=uvs_accessor_index,
     )
@@ -292,6 +316,152 @@ def convert_psd_to_gltf(psd_file_path):
     return gltf
 
 
+def parse_png_compression(val: str) -> Union[int, str]:
+    """
+    Accepts either an integer 0..9 or the literal 'optimize' (case-insensitive).
+    Returns int for compression, or the string 'optimize' for optimize mode.
+    """
+    v = val.strip().lower()
+    if v == "optimize":
+        return "optimize"
+    try:
+        q = int(v)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("must be 0-9 or 'optimize'") from e
+    if not 0 <= q <= 9:
+        raise argparse.ArgumentTypeError("quality must be between 0 and 9")
+    return q
+
+
+def parse_webp_quality(val: str) -> Union[int, str]:
+    """
+    Accepts either an integer 0..100 or the literal 'lossless' (case-insensitive).
+    Returns int for lossy, or the string 'lossless' for lossless mode.
+    """
+    v = val.strip().lower()
+    if v == "lossless":
+        return "lossless"
+    try:
+        q = int(v)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("must be 0-100 or 'lossless'") from e
+    if not 0 <= q <= 100:
+        raise argparse.ArgumentTypeError("quality must be between 0 and 100")
+    return q
+
+
+def build_parser() -> argparse.ArgumentParser:
+    epilog = """\
+Notes:
+  • layer-spacing is the distance (in world units on Z) between adjacent planes.
+  • px-per-unit sets how many pixels wide a layer must be to span 1.0 world unit.
+  • When texture-format is PNG, WebP-specific flags are ignored; BMP has none.
+"""
+    p = argparse.ArgumentParser(
+        prog="psd2gltf",
+        description="Convert PSD layers into transparent GLTF/GLB planes.",
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # --- Positional I/O ---
+    p.add_argument("input", help="Input PSD file")
+    p.add_argument(
+        "output",
+        help="Output file (must be .glb for now).",
+    )
+
+    # --- Scene layout ---
+    p.add_argument(
+        "--layer-spacing",
+        type=float,
+        default=0.5,
+        help="Distance between adjacent layers in 3D units (default: 0.5)",
+    )
+    p.add_argument(
+        "--px-per-unit",
+        type=float,
+        default=1000.0,
+        help="Pixels per 1.0 world unit along X (default: 1000)",
+    )
+
+    # --- Texture format selection ---
+    p.add_argument(
+        "--texture-format",
+        choices=["png", "webp", "bmp"],
+        default="png",
+        help="Image format for exported textures (default: png)",
+    )
+
+    # --- PNG compression ---
+    png = p.add_argument_group("PNG options (apply when --texture-format png)")
+    png.add_argument(
+        "--png-compression",
+        type=parse_png_compression,
+        metavar="(0-9|'optimize')",
+        default=argparse.SUPPRESS,
+        help=f"zlib compression level (0=fast/large .. 9=slow/small; optimize=slowest/smallest; default: {DEFAULT_PNG_COMPRESSION})",
+    )
+
+    # --- WebP compression: single flag, dual meaning ---
+    webp = p.add_argument_group("WebP options (apply when --texture-format webp)")
+    webp.add_argument(
+        "--webp-quality",
+        type=parse_webp_quality,
+        default=argparse.SUPPRESS,
+        help=f"Lossy quality 0-100 (default: {DEFAULT_WEBP_QUALITY}) OR the literal 'lossless' to enable lossless mode",
+        metavar="(0-100|'lossless')",
+    )
+
+    return p
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if os.path.splitext(args.output)[1].lower() != ".glb":
+        raise SystemExit("Output file must be .glb")
+
+    # Sanity checks
+    if args.layer_spacing <= 0:
+        raise SystemExit("--layer-spacing must be > 0")
+    if args.px_per_unit <= 0:
+        raise SystemExit("--px-per-unit must be > 0")
+
+    png_set  = getattr(args, "png_compression", None)
+    webp_set = getattr(args, "webp_quality", None)
+
+    irrelevant = []
+    if args.texture_format != "png" and png_set is not None:
+        irrelevant.append("--png-compression")
+    if args.texture_format != "webp" and webp_set is not None:
+        irrelevant.append("--webp-quality")
+    if irrelevant:
+        print(f"Note: ignored for {args.texture_format.upper()} textures: "
+              + ", ".join(irrelevant), file=sys.stderr)
+
+    # Normalize image settings for downstream use
+    if args.texture_format == "webp":
+        args.gltf_image_mimetype = "image/png"
+        if webp_set == "lossless":
+            args.pillow_args = {"lossless": True, "format": "WEBP"}
+        else:
+            args.pillow_args = {"quality": DEFAULT_WEBP_QUALITY if webp_set is None else webp_set, "format": "WEBP"}
+    elif args.texture_format == "png":
+        if png_set == "optimize":
+            args.pillow_args = {"optimize": True, "format": "PNG"}
+        else:
+            args.pillow_args = {"compress_level": DEFAULT_PNG_COMPRESSION if png_set is None else png_set, "format": "PNG"}
+        args.gltf_image_mimetype = "image/png"
+    elif args.texture_format == "bmp":
+        args.pillow_args = {"format": "BMP"}
+        args.gltf_image_mimetype = "image/bmp"
+
+    return args
+
+
 if __name__ == "__main__":
-    gltf = convert_psd_to_gltf(sys.argv[1])
-    gltf.save("output.glb")
+    args = parse_args()
+    gltf = convert_psd_to_gltf(args)
+    gltf.save(args.output)
