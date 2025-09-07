@@ -238,6 +238,7 @@ def layer_fn(
     buf,
     index_accessor_index,
     uvs_accessor_index,
+    sampler_index,
 ):
     if isinstance(layer, GimpLayer):
         layer_offset = layer.xOffset, layer.yOffset
@@ -278,6 +279,7 @@ def layer_fn(
     gltf.textures.append(
         pygltflib.Texture(
             source=image_index,
+            sampler=sampler_index,
         )
     )
 
@@ -323,6 +325,15 @@ def convert_layered_doc_to_gltf(args):
 
     index_accessor_index, uvs_accessor_index = shared_plane_geometry(gltf=gltf, buf=buf)
 
+    # We don't want textures to tile - it can create artifacts near the edge of the plane.
+    sampler_index = len(gltf.samplers)
+    gltf.samplers.append(
+        pygltflib.Sampler(
+            wrapS=pygltflib.CLAMP_TO_EDGE,
+            wrapT=pygltflib.CLAMP_TO_EDGE,
+        )
+    )
+
     # Run through all layers and add them to the GLTF object graph
     # These objects respect layer folders from the PSD and end up with a single "Root" object
     node_index = exec_every_layer(
@@ -335,6 +346,7 @@ def convert_layered_doc_to_gltf(args):
         args=args,
         index_accessor_index=index_accessor_index,
         uvs_accessor_index=uvs_accessor_index,
+        sampler_index=sampler_index,
     )
 
     scene = pygltflib.Scene(nodes=[node_index])
