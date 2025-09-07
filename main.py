@@ -1,5 +1,5 @@
 """
-psd2gltf — Convert PSD layers into transparent planes in a GLB file.
+psd2gltf — Convert PSD/XCF layers into transparent planes in a GLB file.
 
 Controls (minimal, format-prefixed):
   • --layer-spacing       (default 0.5)
@@ -16,7 +16,7 @@ Examples:
   psd2gltf artwork.psd scene.glb
 
   # GLB with WebP, lossy @ quality 80
-  psd2gltf artwork.psd scene.glb --texture-format webp --webp-quality 80
+  psd2gltf artwork.xcf scene.glb --texture-format webp --webp-quality 80
 
   # GLB with WebP, lossless
   psd2gltf artwork.psd scene.glb --texture-format webp --webp-quality lossless
@@ -25,6 +25,7 @@ Examples:
   psd2gltf in.psd out.glb --texture-format png --png-compression 9 \
       --layer-spacing 0.25 --px-per-unit 2000
 """
+
 import io
 import os
 import sys
@@ -34,6 +35,8 @@ from typing import Union, Sequence
 
 import pygltflib
 from psd_tools import PSDImage
+from gimpformats.gimpXcfDocument import GimpDocument, GimpGroup
+from gimpformats.GimpLayer import GimpLayer
 
 DEFAULT_PNG_COMPRESSION = 6
 DEFAULT_WEBP_QUALITY = 82
@@ -194,12 +197,24 @@ def plane_with_offset_and_size(
     return node_index
 
 
-def exec_every_layer(layer, group_fn, layer_fn, **kwargs):
+def exec_every_layer_psd(layer, group_fn, layer_fn, **kwargs):
     if layer.is_group():
         sub_layers_and_results = [
-            (layer, exec_every_layer(sub_layer, group_fn, layer_fn, **kwargs))
+            (layer, exec_every_layer_psd(sub_layer, group_fn, layer_fn, **kwargs))
             for sub_layer in layer
             if sub_layer.is_visible()
+        ]
+        return group_fn(layer, sub_layers_and_results, **kwargs)
+    else:
+        return layer_fn(layer, **kwargs)
+
+
+def exec_every_layer_xcf(layer, group_fn, layer_fn, **kwargs):
+    if isinstance(layer, GimpGroup):
+        sub_layers_and_results = [
+            (layer, exec_every_layer_xcf(sub_layer, group_fn, layer_fn, **kwargs))
+            for sub_layer in layer.children
+            if sub_layer.visible
         ]
         return group_fn(layer, sub_layers_and_results, **kwargs)
     else:
@@ -224,7 +239,14 @@ def layer_fn(
     index_accessor_index,
     uvs_accessor_index,
 ):
-    pil_image = layer.composite()
+    if isinstance(layer, GimpLayer):
+        layer_offset = layer.xOffset, layer.yOffset
+        layer_size = layer.width, layer.height
+        pil_image = layer.image
+    else:
+        layer_offset = layer.offset
+        layer_size = layer.size
+        pil_image = layer.composite()
     # We don't write directly to the main buffer, in-case Pillow decides to seek or truncate or summin.
     image_bytes_io = io.BytesIO()
     pil_image.save(image_bytes_io, **args.pillow_args)
@@ -246,7 +268,9 @@ def layer_fn(
     image_index = len(gltf.images)
     gltf.images.append(
         pygltflib.Image(
-            bufferView=buffer_view_index, mimeType=args.gltf_image_mimetype, name=layer.name
+            bufferView=buffer_view_index,
+            mimeType=args.gltf_image_mimetype,
+            name=layer.name,
         )
     )
 
@@ -271,8 +295,8 @@ def layer_fn(
     return plane_with_offset_and_size(
         layer.name,
         material_index,
-        layer.offset,
-        layer.size,
+        layer_offset,
+        layer_size,
         pixel_center=pixel_center,
         pixels_per_unit=args.px_per_unit,
         layer_spacing=args.layer_spacing,
@@ -283,8 +307,16 @@ def layer_fn(
     )
 
 
-def convert_psd_to_gltf(args):
-    psd = PSDImage.open(args.input)
+def convert_layered_doc_to_gltf(args):
+    if args.input.endswith(".xcf"):
+        doc = GimpDocument(args.input)
+        pixel_center = (doc.width / 2, doc.height / 2)
+        root_layer = doc.walkTree()
+        exec_every_layer = exec_every_layer_xcf
+    else:
+        root_layer = PSDImage.open(args.input)
+        pixel_center = (root_layer.size[0] / 2, root_layer.size[1] / 2)
+        exec_every_layer = exec_every_layer_psd
 
     gltf = pygltflib.GLTF2()
     buf = io.BytesIO()
@@ -293,9 +325,8 @@ def convert_psd_to_gltf(args):
 
     # Run through all layers and add them to the GLTF object graph
     # These objects respect layer folders from the PSD and end up with a single "Root" object
-    pixel_center = (psd.size[0] / 2, psd.size[1] / 2)
     node_index = exec_every_layer(
-        psd,
+        root_layer,
         group_fn,
         layer_fn,
         buf=buf,
@@ -361,13 +392,13 @@ Notes:
 """
     p = argparse.ArgumentParser(
         prog="psd2gltf",
-        description="Convert PSD layers into transparent GLTF/GLB planes.",
+        description="Convert PSD/XCF layers into transparent GLTF/GLB planes.",
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     # --- Positional I/O ---
-    p.add_argument("input", help="Input PSD file")
+    p.add_argument("input", help="Input PSD/XCF file")
     p.add_argument(
         "output",
         help="Output file (must be .glb for now).",
@@ -431,7 +462,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.px_per_unit <= 0:
         raise SystemExit("--px-per-unit must be > 0")
 
-    png_set  = getattr(args, "png_compression", None)
+    png_set = getattr(args, "png_compression", None)
     webp_set = getattr(args, "webp_quality", None)
 
     irrelevant = []
@@ -440,8 +471,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.texture_format != "webp" and webp_set is not None:
         irrelevant.append("--webp-quality")
     if irrelevant:
-        print(f"Note: ignored for {args.texture_format.upper()} textures: "
-              + ", ".join(irrelevant), file=sys.stderr)
+        print(
+            f"Note: ignored for {args.texture_format.upper()} textures: "
+            + ", ".join(irrelevant),
+            file=sys.stderr,
+        )
 
     # Normalize image settings for downstream use
     if args.texture_format == "webp":
@@ -449,12 +483,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         if webp_set == "lossless":
             args.pillow_args = {"lossless": True, "format": "WEBP"}
         else:
-            args.pillow_args = {"quality": DEFAULT_WEBP_QUALITY if webp_set is None else webp_set, "format": "WEBP"}
+            args.pillow_args = {
+                "quality": DEFAULT_WEBP_QUALITY if webp_set is None else webp_set,
+                "format": "WEBP",
+            }
     elif args.texture_format == "png":
         if png_set == "optimize":
             args.pillow_args = {"optimize": True, "format": "PNG"}
         else:
-            args.pillow_args = {"compress_level": DEFAULT_PNG_COMPRESSION if png_set is None else png_set, "format": "PNG"}
+            args.pillow_args = {
+                "compress_level": DEFAULT_PNG_COMPRESSION
+                if png_set is None
+                else png_set,
+                "format": "PNG",
+            }
         args.gltf_image_mimetype = "image/png"
     elif args.texture_format == "bmp":
         args.pillow_args = {"format": "BMP"}
@@ -465,5 +507,5 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    gltf = convert_psd_to_gltf(args)
+    gltf = convert_layered_doc_to_gltf(args)
     gltf.save(args.output)
