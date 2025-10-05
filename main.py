@@ -209,12 +209,18 @@ def exec_every_layer_psd(layer, group_fn, layer_fn, **kwargs):
         return layer_fn(layer, **kwargs)
 
 
+def layer_visible_xcf(layer):
+    if isinstance(layer, GimpGroup):
+        return layer.layer_options.visible
+    return layer.visible
+
+
 def exec_every_layer_xcf(layer, group_fn, layer_fn, **kwargs):
     if isinstance(layer, GimpGroup):
         sub_layers_and_results = [
             (layer, exec_every_layer_xcf(sub_layer, group_fn, layer_fn, **kwargs))
             for sub_layer in layer.children
-            if sub_layer.visible
+            if layer_visible_xcf(sub_layer)
         ]
         return group_fn(layer, sub_layers_and_results, **kwargs)
     else:
